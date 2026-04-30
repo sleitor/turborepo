@@ -154,8 +154,8 @@ impl ProcessManager {
     }
 
     /// Stop the process manager, closing all child processes. On posix
-    /// systems this will send a SIGINT, and on windows it will just kill
-    /// the process immediately.
+    /// systems this will send a SIGINT, and on windows it will send
+    /// CTRL_BREAK_EVENT to allow the process to shut down gracefully.
     pub async fn stop(&self) {
         self.close(CloseMode::Stop).await
     }
@@ -323,11 +323,7 @@ mod test {
         TaskId::new("test-pkg", "test-task")
     }
 
-    const STOPPED_EXIT: Option<ChildExit> = Some(if cfg!(windows) {
-        ChildExit::Killed
-    } else {
-        ChildExit::Interrupted
-    });
+    const STOPPED_EXIT: Option<ChildExit> = Some(ChildExit::Interrupted);
 
     #[tokio::test]
     async fn test_basic() {

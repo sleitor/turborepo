@@ -62,7 +62,7 @@ pub enum ChildExit {
 
 #[derive(Debug, Clone, Copy)]
 pub enum ShutdownStyle {
-    /// On Windows this immediately kills the process. On Unix it sends SIGINT
+    /// On Windows this sends CTRL_BREAK_EVENT to the process group. On Unix it sends SIGINT
     /// to the process group.
     ///
     /// `Graceful(Some(timeout))` escalates to `Kill` after `timeout` elapses.
@@ -1063,10 +1063,91 @@ impl ShutdownStyle {
 
                 #[cfg(windows)]
                 {
-                    debug!("timeout not supported on windows, killing");
-                    match child.kill().await {
-                        Ok(_) => ChildExit::Killed,
-                        Err(_) => ChildExit::Failed,
+                    // Send CTRL_BREAK_EVENT to the child's process group so it
+                    // can run its shutdown handlers (e.g. Node.js 'SIGINT').
+                    // CTRL_BREAK_EVENT (unlike CTRL_C_EVENT) can be targeted at
+                    // a specific process group ID, which equals the child's PID
+                    // when it was spawned with CREATE_NEW_PROCESS_GROUP.
+                    let sent = if let Some(pid) = child.pid() {
+                        debug!("sending CTRL_BREAK_EVENT to process group {}", pid);
+                        let result = unsafe {
+                            windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
+                                windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
+                                pid,
+                            )
+                        };
+                        result != 0
+                    } else {
+                        false
+                    };
+
+                    if !sent {
+                        debug!("failed to send CTRL_BREAK_EVENT, killing immediately");
+                        return match child.kill().await {
+                            Ok(_) => ChildExit::Killed,
+                            Err(_) => ChildExit::Failed,
+                        };
+                    }
+
+                    let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
+                    let mut command_rx_open = true;
+
+                    loop {
+                        match deadline {
+                            Some(deadline) => {
+                                tokio::select! {
+                                    result = child.wait() => {
+                                        break match result {
+                                            Ok(_) => ChildExit::Interrupted,
+                                            Err(_) => ChildExit::Failed,
+                                        };
+                                    }
+                                    command = command_rx.recv(), if command_rx_open => {
+                                        match command {
+                                            Some(ChildCommand::Kill) => {
+                                                debug!("graceful shutdown interrupted, killing child");
+                                                break match child.kill().await {
+                                                    Ok(_) => ChildExit::Killed,
+                                                    Err(_) => ChildExit::Failed,
+                                                };
+                                            }
+                                            Some(ChildCommand::Shutdown(_)) => {}
+                                            None => command_rx_open = false,
+                                        }
+                                    }
+                                    _ = tokio::time::sleep_until(deadline) => {
+                                        debug!("graceful shutdown timed out, killing child");
+                                        break match child.kill().await {
+                                            Ok(_) => ChildExit::Killed,
+                                            Err(_) => ChildExit::Failed,
+                                        };
+                                    }
+                                }
+                            }
+                            None => {
+                                tokio::select! {
+                                    result = child.wait() => {
+                                        break match result {
+                                            Ok(_) => ChildExit::Interrupted,
+                                            Err(_) => ChildExit::Failed,
+                                        };
+                                    }
+                                    command = command_rx.recv(), if command_rx_open => {
+                                        match command {
+                                            Some(ChildCommand::Kill) => {
+                                                debug!("graceful shutdown interrupted, killing child");
+                                                break match child.kill().await {
+                                                    Ok(_) => ChildExit::Killed,
+                                                    Err(_) => ChildExit::Failed,
+                                                };
+                                            }
+                                            Some(ChildCommand::Shutdown(_)) => {}
+                                            None => command_rx_open = false,
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

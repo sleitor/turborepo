@@ -137,6 +137,14 @@ impl From<Command> for tokio::process::Command {
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd.as_std_path());
         }
+        // Spawn the child in a new process group on Windows so we can target
+        // it with CTRL_BREAK_EVENT during graceful shutdown.
+        // CREATE_NEW_PROCESS_GROUP = 0x00000200
+        #[cfg(windows)]
+        {
+            use tokio::process::windows::CommandExt;
+            cmd.creation_flags(0x00000200);
+        }
         cmd
     }
 }
